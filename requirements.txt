@@ -1,0 +1,15 @@
+--find-links https://download.pytorch.org/whl/torch_stable.html 
+torch==2.1.0+cu121
+transformers==4.44.2
+datasets==2.21.0
+accelerate==0.34.2
+sentencepiece==0.2.0
+evaluate==0.4.3
+rouge==1.0.1
+spacy==3.7.6
+nltk==3.9.1
+ckiptagger==0.2.1
+tqdm==4.66.5
+pandas==2.0.3
+jsonlines==4.0.0
+protobuf==4.25.5
