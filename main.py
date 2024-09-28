@@ -1,13 +1,13 @@
 """
 Fine-tuning a 🤗 Transformers model on summarization.
 """
+import os
 import json
 import math
 import argparse
 from pathlib import Path
 
 import torch
-import numpy as np
 from tqdm.auto import tqdm
 from datasets import Dataset, DatasetDict, load_dataset
 from accelerate import Accelerator
@@ -17,6 +17,8 @@ from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, DataCollatorForSeq2Seq
 
 from src.utils import Evaluator
+
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "0"
 
 def parse_args() -> argparse.Namespace:
     """parse_args"""
@@ -40,11 +42,23 @@ def parse_args() -> argparse.Namespace:
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
-        "--max_length", type=int, default=1024,
+        "--max_source_length",
+        type=int,
+        default=1024,
         help=(
             "The maximum total input sequence length after "
             "tokenization.Sequences longer than this will be truncated, "
             "sequences shorter will be padded."
+        ),
+    )
+    parser.add_argument(
+        "--max_target_length",
+        type=int,
+        default=128,
+        help=(
+            "The maximum total sequence length for target text after "
+            "tokenization. Sequences longer than this will be truncated, "
+            "sequences shorter will be padded. during ``evaluate`` and ``predict``."
         ),
     )
     parser.add_argument(
@@ -64,7 +78,7 @@ def parse_args() -> argparse.Namespace:
         help="Initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument(
-        "--epochs", type=int, default=0,
+        "--num_train_epochs", type=int, default=3,
         help="Total number of training epochs to perform."
     )
     parser.add_argument(
@@ -75,13 +89,12 @@ def parse_args() -> argparse.Namespace:
         "--seed", type=int, default=11207330, help="A seed for reproducible training."
     )
     parser.add_argument(
-        "--stratgy", type=str, default="defaults",
+        "--strategy", type=str, default="defaults",
         help=(
             "Generation Strategies "
             "(greedy, beam_search, top_k_sampling, top_p_sampling, temperature)."
         ),
     )
-    parser.add_argument("--gen_max_length", type=int, default=128)
     parser.add_argument("--gen_num_beams", type=int,default=5)
     parser.add_argument("--gen_top_k", type=int, default=50)
     parser.add_argument("--gen_top_p", type=float, default=1.0)
@@ -122,10 +135,8 @@ def main() -> None:
     config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=False)
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name_or_path,
+        use_fast=False,
         trust_remote_code=False,
-        legacy=False,
-        clean_up_tokenization_spaces=False,
-        use_fast=False
     )
     model = AutoModelForSeq2SeqLM.from_pretrained(
         args.model_name_or_path, trust_remote_code=False, config=config
@@ -172,13 +183,13 @@ def main() -> None:
     def preprocess_function(examples):
         inputs = tokenizer(
             ["summarize: " + inp for inp in examples["maintext"]],
-            max_length=args.max_length,
+            max_length=args.max_source_length,
             padding="max_length",
             truncation=True,
             )
         labels = tokenizer(
             text_target=examples["title"],
-            max_length=128,
+            max_length=args.max_target_length,
             padding="max_length",
             truncation=True,
             )
@@ -190,7 +201,7 @@ def main() -> None:
 
     def build_generation_kwargs(strategy: str) -> dict:
         """build_generation_kwargs"""
-        gen_kwargs = {"max_length": args.gen_max_length}
+        gen_kwargs = {"max_length": args.max_target_length}
 
         strategy_mapping = {
             "greedy": {},
@@ -208,39 +219,45 @@ def main() -> None:
         model.eval()
         all_preds = []
         all_labels = []
-        for batch in tqdm(dataloader, desc=f"{args.stratgy}", colour="red"):
+        gen_kwargs = build_generation_kwargs(args.strategy)
+
+        for batch in dataloader:
             with torch.no_grad():
+                labels = batch["labels"]
                 generated_tokens = accelerator.unwrap_model(model).generate(
                     batch["input_ids"], attention_mask=batch["attention_mask"],
-                    **build_generation_kwargs(args.stratgy),
+                    **gen_kwargs,
                 )
                 generated_tokens = accelerator.pad_across_processes(
                     generated_tokens, dim=1, pad_index=tokenizer.pad_token_id,
                 )
-                labels = batch["labels"]
+                labels = torch.where(labels != -100, labels, tokenizer.pad_token_id)
                 generated_tokens, labels = accelerator.gather_for_metrics(
                     (generated_tokens, labels)
                 )
 
                 generated_tokens = generated_tokens.cpu().numpy()
                 labels = labels.cpu().numpy()
-                labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
 
                 if isinstance(generated_tokens, tuple):
                     generated_tokens = generated_tokens[0]
 
-                decoded_preds = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
-                decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+                decoded_preds = tokenizer.batch_decode(
+                    generated_tokens, skip_special_tokens=True
+                )
+                decoded_labels = tokenizer.batch_decode(
+                    labels, skip_special_tokens=True
+                )
 
                 decoded_preds = [pred.strip() for pred in decoded_preds]
                 decoded_labels = [label.strip() for label in decoded_labels]
 
-                all_preds += decoded_preds
-                all_labels += decoded_labels
+                all_preds.extend(decoded_preds)
+                all_labels.extend(decoded_labels)
 
         return all_preds, all_labels
 
-    if args.epochs > 0 and args.train_file is not None:
+    if args.num_train_epochs > 0 and args.train_file is not None:
         train_dataset = raw_datasets["train"].map(
             preprocess_function,
             batched=True,
@@ -280,13 +297,13 @@ def main() -> None:
         num_update_steps_per_epoch = math.ceil(
             len(train_dataloader) / args.gradient_accumulation_steps
         )
-        max_train_steps = args.epochs * num_update_steps_per_epoch
-        args.epochs = math.ceil(max_train_steps / num_update_steps_per_epoch)
+        max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+        args.num_train_epochs = math.ceil(max_train_steps / num_update_steps_per_epoch)
         progress_bar = tqdm(
             range(max_train_steps), disable=not accelerator.is_local_main_process
         )
 
-        for _ in range(args.epochs):
+        for _ in range(args.num_train_epochs):
             model.train()
             for batch in train_dataloader:
                 with accelerator.accumulate(model):
@@ -299,10 +316,9 @@ def main() -> None:
                 if accelerator.sync_gradients:
                     progress_bar.update(1)
 
-            if args.validation_file is not None:
+            if args.validation_file is not None and args.plot:
                 predictions, labels = evaluate(valid_dataloader)
-                if args.plot:
-                    evaluator.get_rouge(predictions, labels)
+                evaluator.get_rouge(predictions, labels)
 
     if args.test_file is not None:
         test_dataset = raw_datasets["test"].map(
