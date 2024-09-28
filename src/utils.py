@@ -56,29 +56,32 @@ class Evaluator:
     def plot_learning_curves(self) -> None:
         """plot_learning_curves"""
         import matplotlib.pyplot as plt
+
         epochs = range(1, len(self.history) + 1)
         metric_keys = ["rouge-1", "rouge-2", "rouge-l"]
         metric_names = ["Rouge-1", "Rouge-2", "Rouge-L"]
 
-        for key, metric_name in zip(metric_keys, metric_names):
+        _, axes = plt.subplots(3, 1, figsize=(15, 18))
+
+        for ax, key, metric_name in zip(axes, metric_keys, metric_names):
             recall = [result[key]["r"] for result in self.history]
             precision = [result[key]["p"] for result in self.history]
             f_score = [result[key]["f"] for result in self.history]
 
-            plt.figure()
-            plt.plot(epochs, recall, label="Recall")
-            plt.plot(epochs, precision, label="Precision")
-            plt.plot(epochs, f_score, label="F-score")
-            plt.title(f"{metric_name} Metrics History")
-            plt.xlabel("Epoch")
-            plt.ylabel("Score")
-            plt.legend()
-            plt.grid(True)
-            plt.tight_layout()
+            ax.plot(epochs, recall, label=f"{metric_name} Recall", marker='o')
+            ax.plot(epochs, precision, label=f"{metric_name} Precision", marker='o')
+            ax.plot(epochs, f_score, label=f"{metric_name} F-score", marker='o')
+            ax.set_title(f"{metric_name} Metrics History")
+            ax.set_xlabel("Epoch")
+            ax.set_ylabel("Score")
+            ax.legend(loc='lower right')
+            ax.grid(True)
 
-            if self.output_dir is not None:
-                plt.savefig(self.output_dir / f"learning_curve_{metric_name}.png")
-                plt.close()
+        plt.tight_layout()
+
+        if self.output_dir is not None:
+            plt.savefig(self.output_dir / "learning_curve.png")
+            plt.close()
 
         if self.output_dir is not None:
             history_file = self.output_dir / "history.json"
