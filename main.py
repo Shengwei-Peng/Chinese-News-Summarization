@@ -1,7 +1,6 @@
 """
 Fine-tuning a 🤗 Transformers model on summarization.
 """
-import os
 import json
 import math
 import argparse
@@ -14,11 +13,12 @@ from accelerate import Accelerator
 from accelerate.utils import set_seed
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, DataCollatorForSeq2Seq
+from transformers import (
+    AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM, DataCollatorForSeq2Seq
+)
 
 from src.utils import Evaluator
 
-os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "0"
 
 def parse_args() -> argparse.Namespace:
     """parse_args"""
@@ -95,10 +95,10 @@ def parse_args() -> argparse.Namespace:
             "(greedy, beam_search, top_k_sampling, top_p_sampling, temperature)."
         ),
     )
-    parser.add_argument("--gen_num_beams", type=int,default=5)
-    parser.add_argument("--gen_top_k", type=int, default=50)
-    parser.add_argument("--gen_top_p", type=float, default=1.0)
-    parser.add_argument("--gen_temperature", type=float, default=1.0)
+    parser.add_argument("--num_beams", type=int, default=1)
+    parser.add_argument("--top_k", type=int, default=50)
+    parser.add_argument("--top_p", type=float, default=1.0)
+    parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument(
         "--output_dir", type=str, default=None, help="Where to store the final model."
     )
@@ -108,6 +108,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--plot", action="store_true", help="Whether to plot learning curves."
+    )
+    parser.add_argument(
+        "--model_type", type=str, choices=["mt5", "gpt2"], default="mt5",
+        help="Model type to use: 'mt5' for mT5 model, 'gpt2' for GPT-2 model."
     )
 
     args = parser.parse_args()
@@ -133,14 +137,16 @@ def main() -> None:
     evaluator = Evaluator(args.output_dir)
 
     config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=False)
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_name_or_path,
-        use_fast=False,
-        trust_remote_code=False,
-    )
-    model = AutoModelForSeq2SeqLM.from_pretrained(
-        args.model_name_or_path, trust_remote_code=False, config=config
-    )
+
+    if args.model_type == "mt5":
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+        model = AutoModelForSeq2SeqLM.from_pretrained(args.model_name_or_path, config=config)
+    elif args.model_type == "gpt2":
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, padding_side="left")
+        model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, config=config)
+        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+        model.config.pad_token_id = tokenizer.pad_token_id
+        args.max_target_length = args.max_source_length
 
     datasets = {}
     if args.test_file is not None:
@@ -181,53 +187,78 @@ def main() -> None:
     )
 
     def preprocess_function(examples):
-        inputs = tokenizer(
-            ["summarize: " + inp for inp in examples["maintext"]],
-            max_length=args.max_source_length,
-            padding="max_length",
-            truncation=True,
+        if args.model_type == "mt5":
+            inputs = tokenizer(
+                ["summarize: " + inp for inp in examples["maintext"]],
+                max_length=args.max_source_length,
+                padding="max_length",
+                truncation=True,
             )
-        labels = tokenizer(
-            text_target=examples["title"],
-            max_length=args.max_target_length,
-            padding="max_length",
-            truncation=True,
+            labels = tokenizer(
+                text_target=examples["title"],
+                max_length=args.max_target_length,
+                padding="max_length",
+                truncation=True,
             )
-        inputs["labels"] = [
+            inputs["labels"] = [
+                [(l if l != tokenizer.pad_token_id else -100) for l in label]
+                for label in labels["input_ids"]
+            ]
+        elif args.model_type == "gpt2":
+            inputs = tokenizer(
+                [inp + " TL;DR" for inp in examples["maintext"]],
+                max_length=args.max_source_length,
+                padding="max_length",
+                truncation=True,
+            )
+            labels = tokenizer(
+                examples["title"],
+                max_length=args.max_target_length,
+                padding="max_length",
+                truncation=True,
+            )
+            inputs["labels"] = [
                 [(l if l != tokenizer.pad_token_id else -100) for l in label]
                 for label in labels["input_ids"]
             ]
         return inputs
 
-    def build_generation_kwargs(strategy: str) -> dict:
+    def generation_kwargs(strategy: str) -> dict:
         """build_generation_kwargs"""
-        gen_kwargs = {"max_length": args.max_target_length}
+        gen_kwargs = {"max_new_tokens": args.max_target_length}
 
         strategy_mapping = {
-            "greedy": {},
-            "beam_search": {"num_beams": args.gen_num_beams},
-            "top_k_sampling": {"do_sample": True, "top_k": args.gen_top_k},
-            "top_p_sampling": {"do_sample": True, "top_p": args.gen_top_p},
-            "temperature": {"do_sample": True, "temperature": args.gen_temperature}
+            "greedy": {"num_beams": 1},
+            "beam_search": {"num_beams": args.num_beams},
+            "top_k_sampling": {"do_sample": True, "top_k": args.top_k},
+            "top_p_sampling": {"do_sample": True, "top_p": args.top_p},
+            "temperature": {"do_sample": True, "temperature": args.temperature}
         }
 
         gen_kwargs.update(strategy_mapping.get(strategy, {}))
 
         return gen_kwargs
 
-    def evaluate(dataloader: DataLoader) -> tuple:
+    def generate_predictions(dataloader: DataLoader) -> tuple:
         model.eval()
         all_preds = []
         all_labels = []
-        gen_kwargs = build_generation_kwargs(args.strategy)
+        progress_bar = tqdm(dataloader, desc="Generating predictions", leave=False)
 
-        for batch in dataloader:
+        for batch in progress_bar:
             with torch.no_grad():
                 labels = batch["labels"]
-                generated_tokens = accelerator.unwrap_model(model).generate(
-                    batch["input_ids"], attention_mask=batch["attention_mask"],
-                    **gen_kwargs,
-                )
+                if args.model_type == "mt5":
+                    generated_tokens = accelerator.unwrap_model(model).generate(
+                        batch["input_ids"], attention_mask=batch["attention_mask"],
+                        **generation_kwargs(args.strategy),
+                    )
+                elif args.model_type == "gpt2":
+                    generated_tokens = accelerator.unwrap_model(model).generate(
+                        batch["input_ids"], attention_mask=batch["attention_mask"],
+                        pad_token_id=tokenizer.pad_token_id,
+                        **generation_kwargs(args.strategy),
+                    )
                 generated_tokens = accelerator.pad_across_processes(
                     generated_tokens, dim=1, pad_index=tokenizer.pad_token_id,
                 )
@@ -255,6 +286,7 @@ def main() -> None:
                 all_preds.extend(decoded_preds)
                 all_labels.extend(decoded_labels)
 
+        progress_bar.close()
         return all_preds, all_labels
 
     if args.num_train_epochs > 0 and args.train_file is not None:
@@ -317,7 +349,7 @@ def main() -> None:
                     progress_bar.update(1)
 
             if args.validation_file is not None and args.plot:
-                predictions, labels = evaluate(valid_dataloader)
+                predictions, labels = generate_predictions(valid_dataloader)
                 evaluator.get_rouge(predictions, labels)
 
     if args.test_file is not None:
@@ -334,7 +366,7 @@ def main() -> None:
             batch_size=args.per_device_eval_batch_size
         )
         model, test_dataloader = accelerator.prepare(model, test_dataloader)
-        predictions, _ = evaluate(test_dataloader)
+        predictions, _ = generate_predictions(test_dataloader)
         predictions = [
             {"title": p, "id": i} for i, p in zip(raw_datasets["test"]["id"], predictions)
         ]
@@ -348,6 +380,7 @@ def main() -> None:
         unwrapped_model = accelerator.unwrap_model(model)
         for param in unwrapped_model.parameters():
             param.data = param.data.contiguous()
+
         unwrapped_model.save_pretrained(
             args.output_dir,
             is_main_process=accelerator.is_main_process,
