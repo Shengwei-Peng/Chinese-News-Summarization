@@ -11,6 +11,7 @@
 - [Contact](#contact)
 
 ## 🌟 Overview
+The Chinese-News-Summarization project focuses on generating concise and coherent summaries from Chinese news articles. With the massive amount of content published daily, summarization is essential for improving the readability and accessibility of news. This project utilizes pre-trained models from Hugging Face's Transformers library to perform abstractive summarization specifically for Chinese text.
 
 ## 💻 Installation
 
