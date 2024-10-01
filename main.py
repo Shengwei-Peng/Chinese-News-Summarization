@@ -89,16 +89,25 @@ def parse_args() -> argparse.Namespace:
         "--seed", type=int, default=11207330, help="A seed for reproducible training."
     )
     parser.add_argument(
-        "--strategy", type=str, default="defaults",
-        help=(
-            "Generation Strategies "
-            "(greedy, beam_search, top_k_sampling, top_p_sampling, temperature)."
-        ),
+    "--num_beams", type=int, default=1,
+    help="Number of beams for beam search. Set to 1 to disable."
     )
-    parser.add_argument("--num_beams", type=int, default=1)
-    parser.add_argument("--top_k", type=int, default=1)
-    parser.add_argument("--top_p", type=float, default=1.0)
-    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--top_k", type=int, default=1,
+        help="Top-k filtering: keep only the top-k highest probability tokens."
+    )
+    parser.add_argument(
+        "--top_p", type=float, default=1.0,
+        help="Nucleus sampling: keep tokens with cumulative probability > top_p."
+    )
+    parser.add_argument(
+        "--temperature", type=float, default=1.0,
+        help="Controls prediction randomness. Lower values make outputs more deterministic."
+    )
+    parser.add_argument(
+        "--do_sample", action="store_true",
+        help="Enable sampling for generation. Greedy decoding if not set."
+    )
     parser.add_argument(
         "--output_dir", type=str, default=None, help="Where to store the final model."
     )
@@ -222,26 +231,14 @@ def main() -> None:
             ]
         return inputs
 
-    def generation_kwargs(strategy: str) -> dict:
-        """build_generation_kwargs"""
-        gen_kwargs = {
-            "max_new_tokens": args.max_target_length,
-            "num_beams": args.num_beams,
-            "top_k": args.top_k,
-            "top_p": args.top_p,
-            "temperature": args.temperature
-        }
-
-        strategy_mapping = {
-            "greedy": {"num_beams": 1},
-            "top_k_sampling": {"do_sample": True},
-            "top_p_sampling": {"do_sample": True},
-            "temperature": {"do_sample": True}
-        }
-
-        gen_kwargs.update(strategy_mapping.get(strategy, {}))
-
-        return gen_kwargs
+    gen_kwargs = {
+        "max_new_tokens": args.max_target_length,
+        "num_beams": args.num_beams,
+        "top_k": args.top_k,
+        "top_p": args.top_p,
+        "temperature": args.temperature,
+        "do_sample": args.do_sample
+    }
 
     def generate_predictions(dataloader: DataLoader) -> tuple:
         model.eval()
@@ -254,14 +251,16 @@ def main() -> None:
                 labels = batch["labels"]
                 if args.model_type == "mt5":
                     generated_tokens = accelerator.unwrap_model(model).generate(
-                        batch["input_ids"], attention_mask=batch["attention_mask"],
-                        **generation_kwargs(args.strategy),
+                        batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                        **gen_kwargs,
                     )
                 elif args.model_type == "gpt2":
                     generated_tokens = accelerator.unwrap_model(model).generate(
-                        batch["input_ids"], attention_mask=batch["attention_mask"],
+                        batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
                         pad_token_id=tokenizer.pad_token_id,
-                        **generation_kwargs(args.strategy),
+                        **gen_kwargs,
                     )
                 generated_tokens = accelerator.pad_across_processes(
                     generated_tokens, dim=1, pad_index=tokenizer.pad_token_id,
