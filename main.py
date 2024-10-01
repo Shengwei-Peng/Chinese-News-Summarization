@@ -44,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max_source_length",
         type=int,
-        default=1024,
+        default=512,
         help=(
             "The maximum total input sequence length after "
             "tokenization.Sequences longer than this will be truncated, "
@@ -96,7 +96,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--num_beams", type=int, default=1)
-    parser.add_argument("--top_k", type=int, default=50)
+    parser.add_argument("--top_k", type=int, default=1)
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument(
@@ -146,7 +146,6 @@ def main() -> None:
         model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, config=config)
         tokenizer.add_special_tokens({"pad_token": "[PAD]"})
         model.config.pad_token_id = tokenizer.pad_token_id
-        args.max_target_length = args.max_source_length
 
     datasets = {}
     if args.test_file is not None:
@@ -206,14 +205,14 @@ def main() -> None:
             ]
         elif args.model_type == "gpt2":
             inputs = tokenizer(
-                [inp + " TL;DR" for inp in examples["maintext"]],
+                ["summarize: " + inp + " TL;DR" for inp in examples["maintext"]],
                 max_length=args.max_source_length,
                 padding="max_length",
                 truncation=True,
             )
             labels = tokenizer(
                 examples["title"],
-                max_length=args.max_target_length,
+                max_length=args.max_source_length,
                 padding="max_length",
                 truncation=True,
             )
@@ -225,14 +224,19 @@ def main() -> None:
 
     def generation_kwargs(strategy: str) -> dict:
         """build_generation_kwargs"""
-        gen_kwargs = {"max_new_tokens": args.max_target_length}
+        gen_kwargs = {
+            "max_new_tokens": args.max_target_length,
+            "num_beams": args.num_beams,
+            "top_k": args.top_k,
+            "top_p": args.top_p,
+            "temperature": args.temperature
+        }
 
         strategy_mapping = {
             "greedy": {"num_beams": 1},
-            "beam_search": {"num_beams": args.num_beams},
-            "top_k_sampling": {"do_sample": True, "top_k": args.top_k},
-            "top_p_sampling": {"do_sample": True, "top_p": args.top_p},
-            "temperature": {"do_sample": True, "temperature": args.temperature}
+            "top_k_sampling": {"do_sample": True},
+            "top_p_sampling": {"do_sample": True},
+            "temperature": {"do_sample": True}
         }
 
         gen_kwargs.update(strategy_mapping.get(strategy, {}))
@@ -279,7 +283,6 @@ def main() -> None:
                 decoded_labels = tokenizer.batch_decode(
                     labels, skip_special_tokens=True
                 )
-
                 decoded_preds = [pred.strip() for pred in decoded_preds]
                 decoded_labels = [label.strip() for label in decoded_labels]
 
