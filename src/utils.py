@@ -29,7 +29,7 @@ class Evaluator:
         self.ws = WS(data_dir, disable_cuda=False)
         self.rouge = Rouge()
 
-    def get_rouge(self, predictions: list, labels: list) -> None:
+    def get_rouge(self, predictions: list, labels: list) -> dict:
         """get_rouge"""
         if self.ws is None or self.rouge is None:
             self.tw_rouge_init()
@@ -44,14 +44,21 @@ class Evaluator:
 
         predictions, labels = tokenize_and_join(predictions), tokenize_and_join(labels)
         scores = self.rouge.get_scores(predictions, labels, avg=True, ignore_empty=True)
-        result = {i: {j: scores[i][j] * 100 for j in scores[i]} for i in scores}
+        rouge_scores = {i: {j: scores[i][j] * 100 for j in scores[i]} for i in scores}
 
         print(
-            f"ROUGE-1: {result['rouge-1']['f']:.1f}, "
-            f"ROUGE-2: {result['rouge-2']['f']:.1f}, "
-            f"ROUGE-L: {result['rouge-l']['f']:.1f}"
+            f"ROUGE-1: {rouge_scores['rouge-1']['f']:.1f}, "
+            f"ROUGE-2: {rouge_scores['rouge-2']['f']:.1f}, "
+            f"ROUGE-L: {rouge_scores['rouge-l']['f']:.1f}"
         )
-        self.history.append(result)
+        return rouge_scores
+
+    def add(self, loss: float, predictions: list, labels: list) -> None:
+        """add"""
+        self.history.append({
+            "rouge": self.get_rouge(predictions, labels),
+            "loss": loss
+        })
 
     def plot_learning_curves(self) -> None:
         """plot_learning_curves"""
