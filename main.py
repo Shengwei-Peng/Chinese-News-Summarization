@@ -14,7 +14,12 @@ from accelerate.utils import set_seed
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import (
-    AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM, DataCollatorForSeq2Seq
+    AutoConfig,
+    AutoTokenizer,
+    AutoModelForSeq2SeqLM,
+    AutoModelForCausalLM,
+    DataCollatorForSeq2Seq,
+    default_data_collator
 )
 
 from src.utils import Evaluator
@@ -144,8 +149,7 @@ def main() -> None:
     set_seed(args.seed)
     accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
     evaluator = Evaluator(args.output_dir)
-
-    config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=False)
+    config = AutoConfig.from_pretrained(args.model_name_or_path)
 
     if args.model_type == "mt5":
         tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
@@ -159,7 +163,7 @@ def main() -> None:
     datasets = {}
     if args.test_file is not None:
         test_file_path = Path(args.test_file)
-        with test_file_path.open('r', encoding='utf-8') as file:
+        with test_file_path.open("r", encoding="utf-8") as file:
             lines = file.readlines()
 
         modified_json_objs = []
@@ -209,38 +213,52 @@ def main() -> None:
                 truncation=True,
             )
             inputs["labels"] = [
-                [(l if l != tokenizer.pad_token_id else -100) for l in label]
+                [-100 if token == tokenizer.pad_token_id else token for token in label]
                 for label in labels["input_ids"]
             ]
+
         elif args.model_type == "gpt2":
-            inputs = tokenizer(
-                ["summarize: " + inp + " TL;DR" for inp in examples["maintext"]],
-                max_length=args.max_source_length,
-                padding="max_length",
-                truncation=True,
-            )
-            labels = tokenizer(
-                examples["title"],
-                max_length=args.max_source_length,
-                padding="max_length",
-                truncation=True,
-            )
-            inputs["labels"] = [
-                [(l if l != tokenizer.pad_token_id else -100) for l in label]
-                for label in labels["input_ids"]
-            ]
+            input_ids_list = []
+            attention_mask_list = []
+
+            for maintext, title in zip(examples["maintext"], examples["title"]):
+                title = f"[SEP] {title} "
+                maintext_tokens = tokenizer(maintext, truncation=False)["input_ids"]
+                title_tokens = tokenizer(title, truncation=False)["input_ids"]
+
+                total_length = len(maintext_tokens) + len(title_tokens)
+                if total_length > args.max_source_length:
+                    max_maintext_length = args.max_source_length - len(title_tokens)
+                    maintext_tokens = maintext_tokens[:max_maintext_length]
+
+                input_ids = maintext_tokens + title_tokens
+                attention_mask = [1] * len(input_ids)
+
+                padding_length = args.max_source_length - len(input_ids)
+                if padding_length > 0:
+                    input_ids += [tokenizer.pad_token_id] * padding_length
+                    attention_mask += [0] * padding_length
+
+                input_ids_list.append(input_ids)
+                attention_mask_list.append(attention_mask)
+
+            inputs = {
+                "input_ids": torch.tensor(input_ids_list, dtype=torch.long),
+                "attention_mask": torch.tensor(attention_mask_list, dtype=torch.long)
+            }
+            inputs["labels"] = inputs["input_ids"].clone()
+
         return inputs
 
-    gen_kwargs = {
-        "max_new_tokens": args.max_target_length,
-        "num_beams": args.num_beams,
-        "top_k": args.top_k,
-        "top_p": args.top_p,
-        "temperature": args.temperature,
-        "do_sample": args.do_sample
-    }
-
     def generate_predictions(dataloader: DataLoader) -> tuple:
+        gen_kwargs = {
+            "max_new_tokens": args.max_target_length,
+            "num_beams": args.num_beams,
+            "top_k": args.top_k,
+            "top_p": args.top_p,
+            "temperature": args.temperature,
+            "do_sample": args.do_sample
+        }
         model.eval()
         all_preds = []
         all_labels = []
@@ -254,14 +272,14 @@ def main() -> None:
                         batch["input_ids"],
                         attention_mask=batch["attention_mask"],
                         **gen_kwargs,
-                    )
+                )
                 elif args.model_type == "gpt2":
                     generated_tokens = accelerator.unwrap_model(model).generate(
                         batch["input_ids"],
                         attention_mask=batch["attention_mask"],
                         pad_token_id=tokenizer.pad_token_id,
                         **gen_kwargs,
-                    )
+                )
                 generated_tokens = accelerator.pad_across_processes(
                     generated_tokens, dim=1, pad_index=tokenizer.pad_token_id,
                 )
@@ -276,13 +294,20 @@ def main() -> None:
                 if isinstance(generated_tokens, tuple):
                     generated_tokens = generated_tokens[0]
 
+                if args.model_type == "gpt2":
+                    generated_tokens = [
+                        token[args.max_source_length:] for token in generated_tokens
+                    ]
                 decoded_preds = tokenizer.batch_decode(
                     generated_tokens, skip_special_tokens=True
                 )
                 decoded_labels = tokenizer.batch_decode(
                     labels, skip_special_tokens=True
                 )
-                decoded_preds = [pred.strip() for pred in decoded_preds]
+                if args.model_type == "mt5":
+                    decoded_preds = [pred.strip() for pred in decoded_preds]
+                elif args.model_type == "gpt2":
+                    decoded_preds = [(pred.strip().replace(" ", "") or "[Empty]") for pred in decoded_preds]
                 decoded_labels = [label.strip() for label in decoded_labels]
 
                 all_preds.extend(decoded_preds)
@@ -301,7 +326,7 @@ def main() -> None:
         )
         train_dataloader = DataLoader(
             train_dataset,
-            collate_fn=data_collator,
+            collate_fn=data_collator if args.model_type == "mt5" else default_data_collator,
             batch_size=args.per_device_train_batch_size
         )
         if args.validation_file is not None:
@@ -314,7 +339,7 @@ def main() -> None:
             )
             valid_dataloader = DataLoader(
                 valid_dataset,
-                collate_fn=data_collator,
+                collate_fn=data_collator if args.model_type == "mt5" else default_data_collator,
                 batch_size=args.per_device_eval_batch_size
             )
         optimizer = AdamW(model.parameters(), lr=args.learning_rate)
@@ -336,13 +361,23 @@ def main() -> None:
         progress_bar = tqdm(
             range(max_train_steps), disable=not accelerator.is_local_main_process
         )
-
+        loss_fct = torch.nn.CrossEntropyLoss()
         for _ in range(args.num_train_epochs):
+            total_loss = 0
             model.train()
             for batch in train_dataloader:
                 with accelerator.accumulate(model):
                     outputs = model(**batch)
-                    loss = outputs.loss
+                    if args.model_type == "mt5":
+                        loss = outputs.loss
+                    elif args.model_type == "gpt2":
+                        logits = outputs.logits
+                        shift_logits = logits[..., :-1, :].contiguous()
+                        shift_labels =  batch["labels"][..., 1:].contiguous()
+                        loss = loss_fct(shift_logits.transpose(1, 2), shift_labels)
+
+                    total_loss += loss.item()
+
                     accelerator.backward(loss)
                     optimizer.step()
                     optimizer.zero_grad()
@@ -350,9 +385,12 @@ def main() -> None:
                 if accelerator.sync_gradients:
                     progress_bar.update(1)
 
-            if args.validation_file is not None and args.plot:
-                predictions, labels = generate_predictions(valid_dataloader)
-                evaluator.get_rouge(predictions, labels)
+            if args.plot:
+                if args.validation_file:
+                    predictions, labels = generate_predictions(valid_dataloader)
+                    evaluator.add(total_loss / len(train_dataloader), predictions, labels)
+                else:
+                    evaluator.add(total_loss / len(train_dataloader))
 
     if args.test_file is not None:
         test_dataset = raw_datasets["test"].map(
@@ -364,7 +402,7 @@ def main() -> None:
         )
         test_dataloader = DataLoader(
             test_dataset,
-            collate_fn=data_collator,
+            collate_fn=data_collator if args.model_type == "mt5" else default_data_collator,
             batch_size=args.per_device_eval_batch_size
         )
         model, test_dataloader = accelerator.prepare(model, test_dataloader)
