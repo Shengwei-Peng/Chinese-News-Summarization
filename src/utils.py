@@ -43,6 +43,7 @@ class Evaluator:
             labels = [labels]
 
         predictions, labels = tokenize_and_join(predictions), tokenize_and_join(labels)
+
         scores = self.rouge.get_scores(predictions, labels, avg=True, ignore_empty=True)
         rouge_scores = {i: {j: scores[i][j] * 100 for j in scores[i]} for i in scores}
 
@@ -53,10 +54,19 @@ class Evaluator:
         )
         return rouge_scores
 
-    def add(self, loss: float, predictions: list, labels: list) -> None:
+    def add(self, loss: float, predictions: list = None, labels: list = None) -> None:
         """add"""
+        if predictions is None or labels is None:
+            rouge = {
+                "rouge-1": {"r": 0, "p": 0, "f": 0},
+                "rouge-2": {"r": 0, "p": 0, "f": 0},
+                "rouge-l": {"r": 0, "p": 0, "f": 0}
+            }
+        else:
+            rouge = self.get_rouge(predictions, labels)
+
         self.history.append({
-            "rouge": self.get_rouge(predictions, labels),
+            "rouge": rouge,
             "loss": loss
         })
 
@@ -71,9 +81,9 @@ class Evaluator:
         _, axes = plt.subplots(3, 1, figsize=(15, 18))
 
         for ax, key, metric_name in zip(axes, metric_keys, metric_names):
-            recall = [result[key]["r"] for result in self.history]
-            precision = [result[key]["p"] for result in self.history]
-            f_score = [result[key]["f"] for result in self.history]
+            recall = [result["rouge"][key]["r"] for result in self.history]
+            precision = [result["rouge"][key]["p"] for result in self.history]
+            f_score = [result["rouge"][key]["f"] for result in self.history]
 
             ax.plot(epochs, recall, label=f"{metric_name} Recall", marker='o')
             ax.plot(epochs, precision, label=f"{metric_name} Precision", marker='o')
@@ -87,8 +97,23 @@ class Evaluator:
         plt.tight_layout()
 
         if self.output_dir is not None:
-            plt.savefig(self.output_dir / "learning_curve.png")
+            plt.savefig(self.output_dir / "rouge_learning_curve.png")
             plt.close()
+
+        losses = [entry["loss"] for entry in self.history if entry["loss"] is not None]
+
+        if losses:
+            plt.figure(figsize=(10, 6))
+            plt.plot(epochs, losses, label="Loss", marker='o')
+            plt.title("Loss History")
+            plt.xlabel("Epoch")
+            plt.ylabel("Loss")
+            plt.legend(loc='upper right')
+            plt.grid(True)
+
+            if self.output_dir is not None:
+                plt.savefig(self.output_dir / "loss_learning_curve.png")
+                plt.close()
 
         if self.output_dir is not None:
             history_file = self.output_dir / "history.json"
