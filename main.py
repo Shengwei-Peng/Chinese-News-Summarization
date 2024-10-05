@@ -22,7 +22,7 @@ from transformers import (
     default_data_collator
 )
 
-from src.utils import Evaluator
+from src import Evaluator
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,7 +39,7 @@ def parse_args() -> argparse.Namespace:
         help="A csv or a json file containing the validation data."
     )
     parser.add_argument(
-        "--test_file", type=str, default=None,
+        "--test_file", type=Path, default=None,
         help="A csv or a json file containing the test data."
     )
     parser.add_argument(
@@ -94,8 +94,8 @@ def parse_args() -> argparse.Namespace:
         "--seed", type=int, default=11207330, help="A seed for reproducible training."
     )
     parser.add_argument(
-    "--num_beams", type=int, default=1,
-    help="Number of beams for beam search. Set to 1 to disable."
+        "--num_beams", type=int, default=1,
+        help="Number of beams for beam search. Set to 1 to disable."
     )
     parser.add_argument(
         "--top_k", type=int, default=1,
@@ -114,10 +114,10 @@ def parse_args() -> argparse.Namespace:
         help="Enable sampling for generation. Greedy decoding if not set."
     )
     parser.add_argument(
-        "--output_dir", type=str, default=None, help="Where to store the final model."
+        "--output_dir", type=Path, default=None, help="Where to store the final model."
     )
     parser.add_argument(
-        "--prediction_path", type=str, default="prediction.jsonl",
+        "--prediction_path", type=Path, default=Path("./predictions.txt"),
         help="Path to the output prediction file."
     )
     parser.add_argument(
@@ -127,17 +127,13 @@ def parse_args() -> argparse.Namespace:
         "--model_type", type=str, choices=["mt5", "gpt2"], default="mt5",
         help="Model type to use: 'mt5' for mT5 model, 'gpt2' for GPT-2 model."
     )
-
     args = parser.parse_args()
-    args_dict = vars(args).copy()
 
     if args.output_dir is not None:
-        args.output_dir = Path(args.output_dir)
-
-    if args.prediction_path is not None:
-        args.prediction_path = Path(args.prediction_path)
-
-    if args.output_dir is not None:
+        args_dict = {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in vars(args).copy().items()
+        }
         args.output_dir.mkdir(parents=True, exist_ok=True)
         (args.output_dir / "argument.json").write_text(json.dumps(args_dict, indent=4))
 
@@ -148,7 +144,7 @@ def main() -> None:
     args = parse_args()
     set_seed(args.seed)
     accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
-    evaluator = Evaluator(args.output_dir)
+    evaluator = Evaluator(args.output_dir, Path(args.validation_file))
     config = AutoConfig.from_pretrained(args.model_name_or_path)
 
     if args.model_type == "mt5":
@@ -161,17 +157,10 @@ def main() -> None:
         model.config.pad_token_id = tokenizer.pad_token_id
 
     datasets = {}
+
     if args.test_file is not None:
-        test_file_path = Path(args.test_file)
-        with test_file_path.open("r", encoding="utf-8") as file:
-            lines = file.readlines()
-
-        modified_json_objs = []
-        for line in lines:
-            json_obj = json.loads(line)
-            json_obj["title"] = ""
-            modified_json_objs.append(json_obj)
-
+        with args.test_file.open("r", encoding="utf-8") as file:
+            modified_json_objs = [{**json.loads(line), "title": ""} for line in file]
         datasets["test"] = Dataset.from_dict(
             {key: [d[key] for d in modified_json_objs] for key in modified_json_objs[0].keys()}
         )
@@ -187,10 +176,7 @@ def main() -> None:
         )["validation"]
 
     raw_datasets =  DatasetDict(datasets)
-
-    column_names = raw_datasets[
-        "train" if "train" in raw_datasets else next(iter(raw_datasets))
-    ].column_names
+    column_names = raw_datasets[next(iter(raw_datasets))].column_names
 
     data_collator = DataCollatorForSeq2Seq(
         tokenizer,
@@ -198,7 +184,7 @@ def main() -> None:
         label_pad_token_id=-100,
     )
 
-    def preprocess_function(examples):
+    def preprocess_function(examples, is_training=True):
         if args.model_type == "mt5":
             inputs = tokenizer(
                 ["summarize: " + inp for inp in examples["maintext"]],
@@ -206,23 +192,14 @@ def main() -> None:
                 padding="max_length",
                 truncation=True,
             )
-            labels = tokenizer(
-                text_target=examples["title"],
-                max_length=args.max_target_length,
-                padding="max_length",
-                truncation=True,
-            )
-            inputs["labels"] = [
-                [-100 if token == tokenizer.pad_token_id else token for token in label]
-                for label in labels["input_ids"]
-            ]
 
         elif args.model_type == "gpt2":
             input_ids_list = []
             attention_mask_list = []
 
             for maintext, title in zip(examples["maintext"], examples["title"]):
-                title = f"[SEP] {title} "
+                title = f"[SEP] {title} " if is_training else "[SEP] "
+
                 maintext_tokens = tokenizer(maintext, truncation=False)["input_ids"]
                 title_tokens = tokenizer(title, truncation=False)["input_ids"]
 
@@ -246,11 +223,21 @@ def main() -> None:
                 "input_ids": torch.tensor(input_ids_list, dtype=torch.long),
                 "attention_mask": torch.tensor(attention_mask_list, dtype=torch.long)
             }
-            inputs["labels"] = inputs["input_ids"].clone()
+
+        labels = tokenizer(
+            text_target=examples["title"],
+            max_length=args.max_target_length,
+            padding="max_length",
+            truncation=True,
+        )
+        inputs["labels"] = [
+            [-100 if token == tokenizer.pad_token_id else token for token in label]
+            for label in labels["input_ids"]
+            ]
 
         return inputs
 
-    def generate_predictions(dataloader: DataLoader) -> tuple:
+    def generate_predictions(dataloader: DataLoader) -> list:
         gen_kwargs = {
             "max_new_tokens": args.max_target_length,
             "num_beams": args.num_beams,
@@ -260,13 +247,11 @@ def main() -> None:
             "do_sample": args.do_sample
         }
         model.eval()
-        all_preds = []
-        all_labels = []
+        predictions = []
         progress_bar = tqdm(dataloader, desc="Generating predictions", leave=False)
 
         for batch in progress_bar:
             with torch.no_grad():
-                labels = batch["labels"]
                 if args.model_type == "mt5":
                     generated_tokens = accelerator.unwrap_model(model).generate(
                         batch["input_ids"],
@@ -283,13 +268,8 @@ def main() -> None:
                 generated_tokens = accelerator.pad_across_processes(
                     generated_tokens, dim=1, pad_index=tokenizer.pad_token_id,
                 )
-                labels = torch.where(labels != -100, labels, tokenizer.pad_token_id)
-                generated_tokens, labels = accelerator.gather_for_metrics(
-                    (generated_tokens, labels)
-                )
-
+                generated_tokens = accelerator.gather_for_metrics(generated_tokens)
                 generated_tokens = generated_tokens.cpu().numpy()
-                labels = labels.cpu().numpy()
 
                 if isinstance(generated_tokens, tuple):
                     generated_tokens = generated_tokens[0]
@@ -298,25 +278,26 @@ def main() -> None:
                     generated_tokens = [
                         token[args.max_source_length:] for token in generated_tokens
                     ]
+
                 decoded_preds = tokenizer.batch_decode(
                     generated_tokens, skip_special_tokens=True
-                )
-                decoded_labels = tokenizer.batch_decode(
-                    labels, skip_special_tokens=True
                 )
                 if args.model_type == "mt5":
                     decoded_preds = [pred.strip() for pred in decoded_preds]
                 elif args.model_type == "gpt2":
-                    decoded_preds = [(pred.strip().replace(" ", "") or "[Empty]") for pred in decoded_preds]
-                decoded_labels = [label.strip() for label in decoded_labels]
-
-                all_preds.extend(decoded_preds)
-                all_labels.extend(decoded_labels)
+                    decoded_preds = [
+                        (pred.strip().replace(" ", "") or "[Empty]") for pred in decoded_preds
+                    ]
+                predictions.extend(decoded_preds)
 
         progress_bar.close()
-        return all_preds, all_labels
+        return predictions
 
     if args.num_train_epochs > 0 and args.train_file is not None:
+        optimizer = AdamW(model.parameters(), lr=args.learning_rate)
+        if args.model_type == "gpt2":
+            loss_fct = torch.nn.CrossEntropyLoss()
+
         train_dataset = raw_datasets["train"].map(
             preprocess_function,
             batched=True,
@@ -329,9 +310,10 @@ def main() -> None:
             collate_fn=data_collator if args.model_type == "mt5" else default_data_collator,
             batch_size=args.per_device_train_batch_size
         )
+
         if args.validation_file is not None:
             valid_dataset = raw_datasets["validation"].map(
-                preprocess_function,
+                lambda examples: preprocess_function(examples, is_training=False),
                 batched=True,
                 remove_columns=column_names,
                 load_from_cache_file=True,
@@ -342,9 +324,6 @@ def main() -> None:
                 collate_fn=data_collator if args.model_type == "mt5" else default_data_collator,
                 batch_size=args.per_device_eval_batch_size
             )
-        optimizer = AdamW(model.parameters(), lr=args.learning_rate)
-
-        if args.validation_file is not None:
             model, optimizer, train_dataloader, valid_dataloader = accelerator.prepare(
                 model, optimizer, train_dataloader, valid_dataloader
             )
@@ -353,31 +332,33 @@ def main() -> None:
                 model, optimizer, train_dataloader
             )
 
-        num_update_steps_per_epoch = math.ceil(
-            len(train_dataloader) / args.gradient_accumulation_steps
-        )
-        max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-        args.num_train_epochs = math.ceil(max_train_steps / num_update_steps_per_epoch)
         progress_bar = tqdm(
-            range(max_train_steps), disable=not accelerator.is_local_main_process
+            range(
+                args.num_train_epochs *
+                math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+            ), disable=not accelerator.is_local_main_process
         )
-        loss_fct = torch.nn.CrossEntropyLoss()
+
         for _ in range(args.num_train_epochs):
             total_loss = 0
             model.train()
             for batch in train_dataloader:
                 with accelerator.accumulate(model):
-                    outputs = model(**batch)
                     if args.model_type == "mt5":
+                        outputs = model(
+                            batch["input_ids"],
+                            attention_mask=batch["attention_mask"],
+                            labels=batch["labels"],
+                        )
                         loss = outputs.loss
                     elif args.model_type == "gpt2":
+                        outputs = model(batch["input_ids"], attention_mask=batch["attention_mask"])
                         logits = outputs.logits
                         shift_logits = logits[..., :-1, :].contiguous()
-                        shift_labels =  batch["labels"][..., 1:].contiguous()
+                        shift_labels =  batch["input_ids"][..., 1:].contiguous()
                         loss = loss_fct(shift_logits.transpose(1, 2), shift_labels)
 
                     total_loss += loss.item()
-
                     accelerator.backward(loss)
                     optimizer.step()
                     optimizer.zero_grad()
@@ -386,51 +367,53 @@ def main() -> None:
                     progress_bar.update(1)
 
             if args.plot:
-                if args.validation_file:
-                    predictions, labels = generate_predictions(valid_dataloader)
-                    evaluator.add(total_loss / len(train_dataloader), predictions, labels)
+                loss = total_loss / len(train_dataloader)
+                if args.validation_file is not None:
+                    predictions = generate_predictions(valid_dataloader)
+                    evaluator.add(loss, predictions)
                 else:
-                    evaluator.add(total_loss / len(train_dataloader))
+                    evaluator.add(loss)
 
-    if args.test_file is not None:
-        test_dataset = raw_datasets["test"].map(
-            preprocess_function,
-            batched=True,
-            remove_columns=column_names,
-            load_from_cache_file=True,
-            desc="Running tokenizer on Test dataset",
-        )
-        test_dataloader = DataLoader(
-            test_dataset,
-            collate_fn=data_collator if args.model_type == "mt5" else default_data_collator,
-            batch_size=args.per_device_eval_batch_size
-        )
-        model, test_dataloader = accelerator.prepare(model, test_dataloader)
-        predictions, _ = generate_predictions(test_dataloader)
-        predictions = [
-            {"title": p, "id": i} for i, p in zip(raw_datasets["test"]["id"], predictions)
-        ]
-        args.prediction_path.write_text(
-            "\n".join([json.dumps(pred, ensure_ascii=False) for pred in predictions])
-        )
-        print(f"\nThe prediction results have been saved to {args.prediction_path}")
+        if args.output_dir is not None:
+            accelerator.wait_for_everyone()
+            unwrapped_model = accelerator.unwrap_model(model)
+            for param in unwrapped_model.parameters():
+                param.data = param.data.contiguous()
 
-    if args.output_dir is not None:
-        accelerator.wait_for_everyone()
-        unwrapped_model = accelerator.unwrap_model(model)
-        for param in unwrapped_model.parameters():
-            param.data = param.data.contiguous()
+            unwrapped_model.save_pretrained(
+                args.output_dir,
+                is_main_process=accelerator.is_main_process,
+                save_function=accelerator.save
+            )
+            if accelerator.is_main_process:
+                tokenizer.save_pretrained(args.output_dir)
 
-        unwrapped_model.save_pretrained(
-            args.output_dir,
-            is_main_process=accelerator.is_main_process,
-            save_function=accelerator.save
-        )
-        if accelerator.is_main_process:
-            tokenizer.save_pretrained(args.output_dir)
+            if args.plot:
+                evaluator.plot_learning_curves()
 
-        if args.plot:
-            evaluator.plot_learning_curves()
+        if args.test_file is not None:
+            test_dataset = raw_datasets["test"].map(
+                lambda examples: preprocess_function(examples, is_training=False),
+                batched=True,
+                remove_columns=column_names,
+                load_from_cache_file=True,
+                desc="Running tokenizer on Test dataset",
+            )
+            test_dataloader = DataLoader(
+                test_dataset,
+                collate_fn=data_collator if args.model_type == "mt5" else default_data_collator,
+                batch_size=args.per_device_eval_batch_size
+            )
+            model, test_dataloader = accelerator.prepare(model, test_dataloader)
+            predictions = generate_predictions(test_dataloader)
+            predictions = [
+                {"title": p, "id": i} for i, p in zip(raw_datasets["test"]["id"], predictions)
+            ]
+            args.prediction_path.mkdir(parents=True, exist_ok=True)
+            args.prediction_path.write_text(
+                "\n".join([json.dumps(pred, ensure_ascii=False) for pred in predictions])
+            )
+            print(f"\nThe prediction results have been saved to {args.prediction_path}")
 
 if __name__ == "__main__":
     main()

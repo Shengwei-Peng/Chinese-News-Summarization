@@ -5,11 +5,19 @@ from pathlib import Path
 
 class Evaluator:
     """Evaluator"""
-    def __init__(self, output_dir: Path = None) -> None:
+    def __init__(self, output_dir: Path = None, refs_file: Path = None) -> None:
         self.output_dir = output_dir
         self.history = []
         self.ws = None
         self.rouge = None
+        if refs_file:
+            refs = {
+                line['id']: line['title'].strip() + '\n'
+                for line in map(json.loads, refs_file.read_text(encoding="utf-8").splitlines())
+            }
+            self.refs = list(refs.values())
+        else:
+            self.refs = None
 
     def tw_rouge_init(self) -> None:
         """tw_rouge_init"""
@@ -29,41 +37,42 @@ class Evaluator:
         self.ws = WS(data_dir, disable_cuda=False)
         self.rouge = Rouge()
 
-    def get_rouge(self, predictions: list, labels: list) -> dict:
+    def get_rouge(
+        self, preds: list, refs: list, avg: bool = True, ignore_empty: bool = False
+        ) -> dict:
         """get_rouge"""
-        if self.ws is None or self.rouge is None:
+        if (self.ws is None or self.rouge is None) and self.refs is not None:
             self.tw_rouge_init()
 
         def tokenize_and_join(sentences):
             return [" ".join(toks) for toks in self.ws(sentences)]
 
-        if not isinstance(predictions, list):
-            predictions = [predictions]
-        if not isinstance(labels, list):
-            labels = [labels]
+        if not isinstance(preds, list):
+            preds = [preds]
+        if not isinstance(refs, list):
+            refs = [refs]
+        preds, refs = tokenize_and_join(preds), tokenize_and_join(refs)
 
-        predictions, labels = tokenize_and_join(predictions), tokenize_and_join(labels)
-
-        scores = self.rouge.get_scores(predictions, labels, avg=True, ignore_empty=True)
+        scores = self.rouge.get_scores(preds, refs, avg=avg, ignore_empty=ignore_empty)
         rouge_scores = {i: {j: scores[i][j] * 100 for j in scores[i]} for i in scores}
-
         print(
             f"ROUGE-1: {rouge_scores['rouge-1']['f']:.1f}, "
             f"ROUGE-2: {rouge_scores['rouge-2']['f']:.1f}, "
             f"ROUGE-L: {rouge_scores['rouge-l']['f']:.1f}"
         )
+
         return rouge_scores
 
-    def add(self, loss: float, predictions: list = None, labels: list = None) -> None:
+    def add(self, loss: float, predictions: list = None) -> None:
         """add"""
-        if predictions is None or labels is None:
+        if predictions is None or self.refs is None:
             rouge = {
                 "rouge-1": {"r": 0, "p": 0, "f": 0},
                 "rouge-2": {"r": 0, "p": 0, "f": 0},
                 "rouge-l": {"r": 0, "p": 0, "f": 0}
             }
         else:
-            rouge = self.get_rouge(predictions, labels)
+            rouge = self.get_rouge(predictions, self.refs)
 
         self.history.append({
             "rouge": rouge,
