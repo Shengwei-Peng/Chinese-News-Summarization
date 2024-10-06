@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
         help="A csv or a json file containing the training data."
     )
     parser.add_argument(
-        "--validation_file", type=str, default=None,
+        "--validation_file", type=Path, default=None,
         help="A csv or a json file containing the validation data."
     )
     parser.add_argument(
@@ -144,7 +144,7 @@ def main() -> None:
     args = parse_args()
     set_seed(args.seed)
     accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
-    evaluator = Evaluator(args.output_dir, Path(args.validation_file))
+    evaluator = Evaluator(args.output_dir, args.validation_file)
     config = AutoConfig.from_pretrained(args.model_name_or_path)
 
     if args.model_type == "mt5":
@@ -172,7 +172,7 @@ def main() -> None:
 
     if args.validation_file is not None:
         datasets["validation"] = load_dataset(
-            "json", data_files={"validation": args.validation_file}
+            "json", data_files={"validation": str(args.validation_file)}
         )["validation"]
 
     raw_datasets =  DatasetDict(datasets)
@@ -374,46 +374,46 @@ def main() -> None:
                 else:
                     evaluator.add(loss)
 
-        if args.output_dir is not None:
-            accelerator.wait_for_everyone()
-            unwrapped_model = accelerator.unwrap_model(model)
-            for param in unwrapped_model.parameters():
-                param.data = param.data.contiguous()
+    if args.output_dir is not None:
+        accelerator.wait_for_everyone()
+        unwrapped_model = accelerator.unwrap_model(model)
+        for param in unwrapped_model.parameters():
+            param.data = param.data.contiguous()
 
-            unwrapped_model.save_pretrained(
-                args.output_dir,
-                is_main_process=accelerator.is_main_process,
-                save_function=accelerator.save
-            )
-            if accelerator.is_main_process:
-                tokenizer.save_pretrained(args.output_dir)
+        unwrapped_model.save_pretrained(
+            args.output_dir,
+            is_main_process=accelerator.is_main_process,
+            save_function=accelerator.save
+        )
+        if accelerator.is_main_process:
+            tokenizer.save_pretrained(args.output_dir)
 
-            if args.plot:
-                evaluator.plot_learning_curves()
+        if args.plot:
+            evaluator.plot_learning_curves()
 
-        if args.test_file is not None:
-            test_dataset = raw_datasets["test"].map(
-                lambda examples: preprocess_function(examples, is_training=False),
-                batched=True,
-                remove_columns=column_names,
-                load_from_cache_file=True,
-                desc="Running tokenizer on Test dataset",
-            )
-            test_dataloader = DataLoader(
-                test_dataset,
-                collate_fn=data_collator if args.model_type == "mt5" else default_data_collator,
-                batch_size=args.per_device_eval_batch_size
-            )
-            model, test_dataloader = accelerator.prepare(model, test_dataloader)
-            predictions = generate_predictions(test_dataloader)
-            predictions = [
-                {"title": p, "id": i} for i, p in zip(raw_datasets["test"]["id"], predictions)
-            ]
-            args.prediction_path.mkdir(parents=True, exist_ok=True)
-            args.prediction_path.write_text(
-                "\n".join([json.dumps(pred, ensure_ascii=False) for pred in predictions])
-            )
-            print(f"\nThe prediction results have been saved to {args.prediction_path}")
+    if args.test_file is not None:
+        test_dataset = raw_datasets["test"].map(
+            lambda examples: preprocess_function(examples, is_training=False),
+            batched=True,
+            remove_columns=column_names,
+            load_from_cache_file=True,
+            desc="Running tokenizer on Test dataset",
+        )
+        test_dataloader = DataLoader(
+            test_dataset,
+            collate_fn=data_collator if args.model_type == "mt5" else default_data_collator,
+            batch_size=args.per_device_eval_batch_size
+        )
+        model, test_dataloader = accelerator.prepare(model, test_dataloader)
+        predictions = generate_predictions(test_dataloader)
+        predictions = [
+            {"title": p, "id": i} for i, p in zip(raw_datasets["test"]["id"], predictions)
+        ]
+        args.prediction_path.parent.mkdir(parents=True, exist_ok=True)
+        args.prediction_path.write_text(
+            "\n".join([json.dumps(pred, ensure_ascii=False) for pred in predictions])
+        )
+        print(f"\nThe prediction results have been saved to {args.prediction_path}")
 
 if __name__ == "__main__":
     main()
