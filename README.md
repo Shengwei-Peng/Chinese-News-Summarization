@@ -63,7 +63,7 @@ python main.py \
     --seed 11207330 \
     --model_type mt5 \
     --output_dir ./mt5 \
-    --prediction_path ./prediction.jsonl \
+    --prediction_path ./predictions.jsonl \
     --plot
 ```
 
@@ -84,7 +84,7 @@ If you prefer to train the model without validation or testing in a simplified m
         --train_file ./data/train.jsonl \
         --per_device_train_batch_size 8 \
         --gradient_accumulation_steps 1 \
-        --max_source_length 1024 \
+        --max_source_length 512 \
         --max_target_length 128 \
         --num_train_epochs 3 \
         --learning_rate 5e-5 \
@@ -116,14 +116,34 @@ To perform inference on new data after training the model, you can use the follo
 ```bash
 python main.py \
     --model_name_or_path ./mt5-small \
-    --test_file ./data/public.jsonl \
+    --test_file ./data/sample_test.jsonl \
     --per_device_eval_batch_size 8 \
     --max_source_length 2048 \
     --max_target_length 128 \
     --seed 11207330 \
     --model_type mt5 \
-    --prediction_path submission.jsonl
+    --prediction_path predictions.jsonl \
+    --num_beams 5 \
+    --top_k 50 \
+    --top_p 0.9 \
+    --temperature 0.7 \
+    --do_sample
 ```
+
+### Generation Strategies
+
+- **Beam Search (`--num_beams`)**: Controls the number of beams for beam search. Higher values improve search diversity but increase computation. Setting it to 1 disables beam search (**Greedy decoding**).
+
+- **Top-k Sampling (`--top_k`)**: Limits token selection to the top-k highest probability tokens. A higher value of k provides more diversity in output.
+
+- **Top-p Sampling (`--top_p`)**: Selects tokens from the top cumulative probability p (between 0 and 1). A lower p results in more focused and deterministic outputs.
+
+- **Temperature (`--temperature`)**: Adjusts the randomness of predictions. A value < 1 makes the model more conservative, while values > 1 make outputs more random.
+
+- **Sampling (`--do_sample`)**: Enables stochastic sampling. If not set, the model will default to greedy decoding (always selecting the highest probability token).
+
+These parameters can be adjusted together to fine-tune how creative or focused the model's generated output will be during inference.
+
 
 ## 🙏 Acknowledgements
 
