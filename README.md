@@ -43,16 +43,16 @@ Once you've installed the dependencies, you can start using the summarization mo
         }
         ```
 
-### 2. **Training, Validation, Testing, and Plotting:**
+### 2. **Training, Testing, and Plotting:**
 
-After preparing your dataset, you can train, validate, test the model, and generate plots to evaluate its performance. You can combine all these steps into a single command as follows:
+After preparing your dataset, you can train, test the model, and generate plots to evaluate its performance. You can combine all these steps into a single command as follows:
 
 ```bash
 python main.py \
     --model_name_or_path google/mt5-small \
     --train_file ./data/train.jsonl \
-    --validation_file ./data/public.jsonl \
     --test_file ./data/sample_test.jsonl \
+    --plot_file ./data/public.jsonl \
     --per_device_train_batch_size 8 \
     --gradient_accumulation_steps 1 \
     --per_device_eval_batch_size 8 \
@@ -74,7 +74,7 @@ pip install matplotlib tensorflow
 ```
 
 ### 3. Training the Model:
-If you prefer to train the model without validation or testing in a simplified manner, you can use the following commands for **mT5** or **GPT-2** models:
+If you prefer to train the model without testing or ploting, you can use the following commands for **mT5** or **GPT-2** models:
 
 - #### mT5:
     Use the following command to train the model with the mT5 model:

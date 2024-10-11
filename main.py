@@ -32,15 +32,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--train_file", type=str, default=None,
-        help="A csv or a json file containing the training data."
-    )
-    parser.add_argument(
-        "--validation_file", type=Path, default=None,
-        help="A csv or a json file containing the validation data."
+        help="A jsonl file containing the training data."
     )
     parser.add_argument(
         "--test_file", type=Path, default=None,
-        help="A csv or a json file containing the test data."
+        help="A jsonl file containing the test data."
+    )
+    parser.add_argument(
+        "--plot_file", type=Path, default=None,
+        help="A jsonl file containing data used solely for plotting the learning curve."
     )
     parser.add_argument(
         "--model_name_or_path", type=str, required=False,
@@ -144,17 +144,17 @@ def main() -> None:
     args = parse_args()
     set_seed(args.seed)
     accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
-    evaluator = Evaluator(args.output_dir, args.validation_file)
+    evaluator = Evaluator(args.output_dir, args.plot_file)
     config = AutoConfig.from_pretrained(args.model_name_or_path)
 
-    if args.model_type == "mt5":
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
-        model = AutoModelForSeq2SeqLM.from_pretrained(args.model_name_or_path, config=config)
-    elif args.model_type == "gpt2":
+    if args.model_type == "gpt2":
         tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, padding_side="left")
         model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, config=config)
         tokenizer.add_special_tokens({"pad_token": "[PAD]"})
         model.config.pad_token_id = tokenizer.pad_token_id
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+        model = AutoModelForSeq2SeqLM.from_pretrained(args.model_name_or_path, config=config)
 
     datasets = {}
 
@@ -170,10 +170,10 @@ def main() -> None:
             "json", data_files={"train": args.train_file}
         )["train"]
 
-    if args.validation_file is not None:
-        datasets["validation"] = load_dataset(
-            "json", data_files={"validation": str(args.validation_file)}
-        )["validation"]
+    if args.plot_file is not None:
+        datasets["plot"] = load_dataset(
+            "json", data_files={"plot": str(args.plot_file)}
+        )["plot"]
 
     raw_datasets =  DatasetDict(datasets)
     column_names = raw_datasets[next(iter(raw_datasets))].column_names
@@ -185,15 +185,7 @@ def main() -> None:
     )
 
     def preprocess_function(examples, is_training=True):
-        if args.model_type == "mt5":
-            inputs = tokenizer(
-                ["summarize: " + inp for inp in examples["maintext"]],
-                max_length=args.max_source_length,
-                padding="max_length",
-                truncation=True,
-            )
-
-        elif args.model_type == "gpt2":
+        if args.model_type == "gpt2":
             input_ids_list = []
             attention_mask_list = []
 
@@ -223,6 +215,14 @@ def main() -> None:
                 "input_ids": torch.tensor(input_ids_list, dtype=torch.long),
                 "attention_mask": torch.tensor(attention_mask_list, dtype=torch.long)
             }
+
+        else:
+            inputs = tokenizer(
+                ["summarize: " + inp for inp in examples["maintext"]],
+                max_length=args.max_source_length,
+                padding="max_length",
+                truncation=True,
+            )
 
         labels = tokenizer(
             text_target=examples["title"],
@@ -311,21 +311,21 @@ def main() -> None:
             batch_size=args.per_device_train_batch_size
         )
 
-        if args.validation_file is not None:
-            valid_dataset = raw_datasets["validation"].map(
+        if args.plot_file is not None:
+            plot_dataset = raw_datasets["plot"].map(
                 lambda examples: preprocess_function(examples, is_training=False),
                 batched=True,
                 remove_columns=column_names,
                 load_from_cache_file=True,
-                desc="Running tokenizer on validation dataset",
+                desc="Running tokenizer on plot dataset",
             )
-            valid_dataloader = DataLoader(
-                valid_dataset,
+            plot_dataloader = DataLoader(
+                plot_dataset,
                 collate_fn=data_collator if args.model_type == "mt5" else default_data_collator,
                 batch_size=args.per_device_eval_batch_size
             )
-            model, optimizer, train_dataloader, valid_dataloader = accelerator.prepare(
-                model, optimizer, train_dataloader, valid_dataloader
+            model, optimizer, train_dataloader, plot_dataloader = accelerator.prepare(
+                model, optimizer, train_dataloader, plot_dataloader
             )
         else:
             model, optimizer, train_dataloader = accelerator.prepare(
@@ -344,19 +344,19 @@ def main() -> None:
             model.train()
             for batch in train_dataloader:
                 with accelerator.accumulate(model):
-                    if args.model_type == "mt5":
+                    if args.model_type == "gpt2":
+                        outputs = model(batch["input_ids"], attention_mask=batch["attention_mask"])
+                        logits = outputs.logits
+                        shift_logits = logits[..., :-1, :].contiguous()
+                        shift_labels =  batch["input_ids"][..., 1:].contiguous()
+                        loss = loss_fct(shift_logits.transpose(1, 2), shift_labels)
+                    else:
                         outputs = model(
                             batch["input_ids"],
                             attention_mask=batch["attention_mask"],
                             labels=batch["labels"],
                         )
                         loss = outputs.loss
-                    elif args.model_type == "gpt2":
-                        outputs = model(batch["input_ids"], attention_mask=batch["attention_mask"])
-                        logits = outputs.logits
-                        shift_logits = logits[..., :-1, :].contiguous()
-                        shift_labels =  batch["input_ids"][..., 1:].contiguous()
-                        loss = loss_fct(shift_logits.transpose(1, 2), shift_labels)
 
                     total_loss += loss.item()
                     accelerator.backward(loss)
@@ -368,8 +368,8 @@ def main() -> None:
 
             if args.plot:
                 loss = total_loss / len(train_dataloader)
-                if args.validation_file is not None:
-                    predictions = generate_predictions(valid_dataloader)
+                if args.plot_file is not None:
+                    predictions = generate_predictions(plot_dataloader)
                     evaluator.add(loss, predictions)
                 else:
                     evaluator.add(loss)
